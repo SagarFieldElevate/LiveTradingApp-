@@ -20,6 +20,8 @@ import { circuitBreaker } from './services/circuitBreaker';
 import { complianceLogger } from './services/complianceLogger';
 import { notificationService } from './services/notificationService';
 import { polygonService } from './services/polygonService';
+import { databaseService } from './config/database';
+import { tradeHistoryService } from './services/tradeHistoryService';
 import { getMetrics } from './monitoring/metrics';
 
 dotenv.config();
@@ -95,35 +97,39 @@ process.on('unhandledRejection', async (reason, promise) => {
 // Initialize services in proper order
 async function initializeServices() {
   try {
-    // 1. Pinecone first (needed by other services)
+    // 1. Database first (needed by many other services)
+    await databaseService.initialize();
+    logger.info('Database service initialized');
+
+    // 2. Pinecone second (needed by other services)
     await pineconeService.initialize();
     logger.info('Pinecone service initialized');
 
-    // 2. AI Parser (needed by strategy manager)
+    // 3. AI Parser (needed by strategy manager)
     // No initialization needed
     logger.info('AI Parser ready');
 
-    // 3. Strategy Manager
+    // 4. Strategy Manager
     await strategyManager.initialize();
     logger.info('Strategy Manager initialized');
 
-    // 4. Market Data Stream
+    // 5. Market Data Stream
     await marketDataStream.connect();
     logger.info('Market Data Stream connected');
 
-    // 5. Polygon Service (for traditional assets)
+    // 6. Polygon Service (for traditional assets)
     await polygonService.initialize();
     logger.info('Polygon Service initialized');
 
-    // 6. Portfolio Monitor
+    // 7. Portfolio Monitor
     await portfolioMonitor.initialize();
     logger.info('Portfolio Monitor initialized');
 
-    // 7. Trade Executor
+    // 8. Trade Executor
     // Depends on portfolio monitor being initialized
     logger.info('Trade Executor ready');
 
-    // 8. Condition Monitor
+    // 9. Condition Monitor
     // Depends on market data stream
     logger.info('Condition Monitor ready');
 

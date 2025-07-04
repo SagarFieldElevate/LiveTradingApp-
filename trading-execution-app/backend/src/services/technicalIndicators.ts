@@ -1,4 +1,5 @@
 import { logger } from '../utils/logger';
+import { polygonService } from './polygonService';
 
 interface PriceData {
   timestamp: Date;
@@ -12,6 +13,7 @@ interface PriceData {
 export class TechnicalIndicators {
   private priceHistory: Map<string, PriceData[]> = new Map();
   private readonly MAX_HISTORY = 1000; // Keep last 1000 candles
+  private readonly TRADITIONAL_ASSETS = ['WTI_CRUDE_OIL', 'GOLD', 'SPY', 'QQQ', 'AAPL', 'MSFT'];
 
   addPriceData(symbol: string, data: PriceData) {
     if (!this.priceHistory.has(symbol)) {
@@ -133,6 +135,45 @@ export class TechnicalIndicators {
     return ((currentPrice - comparePrice) / comparePrice) * 100;
   }
 
+  async getCurrentPriceAsync(symbol: string): Promise<number | null> {
+    // Check if we have recent cached data first
+    const history = this.priceHistory.get(symbol);
+    if (history && history.length > 0) {
+      const latest = history[history.length - 1];
+      const age = (new Date().getTime() - latest.timestamp.getTime()) / 1000;
+      
+      // If data is fresh (less than 10 seconds old), use it
+      if (age <= 10) {
+        return latest.close;
+      }
+    }
+
+    // For traditional assets, fetch from Polygon
+    if (this.TRADITIONAL_ASSETS.includes(symbol)) {
+      try {
+        const quote = await polygonService.fetchQuote(symbol);
+        if (quote && quote.price) {
+          // Add to price history for future calculations
+          this.addPriceData(symbol, {
+            timestamp: quote.timestamp,
+            open: quote.price,
+            high: quote.price,
+            low: quote.price,
+            close: quote.price,
+            volume: 0
+          });
+          return quote.price;
+        }
+      } catch (error) {
+        logger.error(`Failed to fetch ${symbol} price from Polygon:`, error);
+      }
+    }
+
+    // For crypto assets, return cached value or null
+    return history && history.length > 0 ? history[history.length - 1].close : null;
+  }
+
+  // Synchronous version for backwards compatibility
   getCurrentPrice(symbol: string): number | null {
     const history = this.priceHistory.get(symbol);
     if (!history || history.length === 0) {
@@ -163,6 +204,11 @@ export class TechnicalIndicators {
     const age = (new Date().getTime() - latest.timestamp.getTime()) / 1000;
     
     return age <= maxAgeSeconds;
+  }
+
+  async ensurePriceData(symbol: string): Promise<boolean> {
+    const currentPrice = await this.getCurrentPriceAsync(symbol);
+    return currentPrice !== null;
   }
 }
 

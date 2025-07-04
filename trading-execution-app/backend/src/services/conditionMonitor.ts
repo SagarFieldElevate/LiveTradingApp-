@@ -11,6 +11,7 @@ export class ConditionMonitor extends EventEmitter {
   private isMonitoring = false;
   private conditionCheckCount = 0;
   private lastCheckTime = Date.now();
+  private triggerDelayTracking: Map<string, Date> = new Map(); // Track when triggers were first met
 
   async startMonitoring() {
     if (this.isMonitoring) {
@@ -120,6 +121,12 @@ export class ConditionMonitor extends EventEmitter {
       case 'correlation':
         return await this.checkCorrelation(condition);
         
+      case 'single_correlation':
+        return await this.checkSingleCorrelation(condition);
+        
+      case 'multi_asset_correlation':
+        return await this.checkMultiAssetCorrelation(condition);
+        
       case 'technical_indicator':
         return await this.checkTechnicalIndicator(condition);
         
@@ -130,6 +137,11 @@ export class ConditionMonitor extends EventEmitter {
   }
 
   private async checkPercentageMove(condition: EntryCondition): Promise<boolean> {
+    if (!condition.primary_asset || condition.threshold === undefined) {
+      logger.error('Invalid percentage move condition - missing primary_asset or threshold');
+      return false;
+    }
+
     try {
       const percentMove = await technicalIndicators.getPercentageMove(
         condition.primary_asset,
@@ -148,6 +160,8 @@ export class ConditionMonitor extends EventEmitter {
         case 'any':
           conditionMet = Math.abs(percentMove) > condition.threshold;
           break;
+        default:
+          conditionMet = Math.abs(percentMove) > condition.threshold;
       }
 
       if (conditionMet) {
@@ -162,15 +176,16 @@ export class ConditionMonitor extends EventEmitter {
   }
 
   private async checkCorrelation(condition: EntryCondition): Promise<boolean> {
-    if (!condition.secondary_asset || !condition.additional_params?.correlation_threshold) {
-      logger.error('Invalid correlation condition');
+    if (!condition.secondary_asset || !condition.additional_params?.correlation_threshold || condition.threshold === undefined) {
+      logger.error('Invalid correlation condition - missing required fields');
       return false;
     }
 
     try {
       // First check correlation threshold
+      const primaryAsset = condition.primary_asset || 'BTC';
       const correlation = await technicalIndicators.calculateCorrelation(
-        condition.primary_asset,
+        primaryAsset,
         condition.secondary_asset,
         20 // 20 period correlation
       );
@@ -194,6 +209,145 @@ export class ConditionMonitor extends EventEmitter {
       return moveConditionMet;
     } catch (error) {
       logger.error('Error checking correlation:', error);
+      return false;
+    }
+  }
+
+  private async checkSingleCorrelation(condition: EntryCondition): Promise<boolean> {
+    if (!condition.secondary_asset || !condition.threshold) {
+      logger.error('Invalid single correlation condition - missing secondary_asset or threshold');
+      return false;
+    }
+
+    try {
+      // Check correlation threshold if specified
+      if (condition.additional_params?.correlation_threshold) {
+        const correlation = await technicalIndicators.calculateCorrelation(
+          condition.primary_asset || condition.target_asset || 'BTC',
+          condition.secondary_asset,
+          20 // 20 period correlation
+        );
+
+        if (Math.abs(correlation) < condition.additional_params.correlation_threshold) {
+          return false; // Correlation not strong enough
+        }
+      }
+
+      // Check for the percentage move
+      const percentMove = await technicalIndicators.getPercentageMove(
+        condition.secondary_asset,
+        condition.timeframe || '1h'
+      );
+
+      const moveConditionMet = Math.abs(percentMove) > condition.threshold;
+
+      if (moveConditionMet) {
+        logger.info(`Single correlation condition met: ${condition.secondary_asset} moved ${percentMove.toFixed(2)}%`);
+      }
+
+      return moveConditionMet;
+    } catch (error) {
+      logger.error('Error checking single correlation:', error);
+      return false;
+    }
+  }
+
+  private async checkMultiAssetCorrelation(condition: EntryCondition): Promise<boolean> {
+    if (!condition.triggers || !Array.isArray(condition.triggers) || condition.triggers.length === 0) {
+      logger.error('Invalid multi asset correlation condition - missing triggers');
+      return false;
+    }
+
+    try {
+      // Check all triggers first
+      const triggerResults = await Promise.all(
+        condition.triggers.map(async (trigger) => {
+          if (!trigger.asset) {
+            logger.warn('Trigger missing asset name');
+            return false;
+          }
+
+          // Use async price fetching for traditional assets
+          let percentMove: number;
+          if (['WTI_CRUDE_OIL', 'GOLD', 'SPY', 'QQQ'].includes(trigger.asset)) {
+            const currentPrice = await technicalIndicators.getCurrentPriceAsync(trigger.asset);
+            if (!currentPrice) {
+              logger.warn(`No price data available for ${trigger.asset}`);
+              return false;
+            }
+            // Calculate simple percentage move (would need historical data for proper calculation)
+            percentMove = 0; // Placeholder - needs proper historical price comparison
+          } else {
+            percentMove = await technicalIndicators.getPercentageMove(
+              trigger.asset,
+              condition.timeframe || '1h'
+            );
+          }
+
+          const threshold = trigger.threshold_percent || 2.0; // Default 2% threshold
+          
+          let conditionMet = false;
+          switch (trigger.direction) {
+            case 'up':
+              conditionMet = percentMove > threshold;
+              break;
+            case 'down':
+              conditionMet = percentMove < -threshold;
+              break;
+            default:
+              conditionMet = Math.abs(percentMove) > threshold;
+          }
+
+          if (conditionMet) {
+            logger.info(`Multi-asset trigger met: ${trigger.asset} moved ${percentMove.toFixed(2)}% ${trigger.direction}`);
+          }
+
+          return conditionMet;
+        })
+      );
+
+      // All triggers must be met for multi-asset condition
+      const allTriggersActive = triggerResults.every(result => result === true);
+      
+      if (!allTriggersActive) {
+        return false;
+      }
+
+      // Handle delay_days if specified
+      if (condition.delay_days && condition.delay_days > 0) {
+        const delayKey = `${condition.target_asset}_${condition.triggers.map(t => t.asset).join('_')}`;
+        const now = new Date();
+        
+        // Check if triggers were already activated
+        if (this.triggerDelayTracking.has(delayKey)) {
+          const triggerTime = this.triggerDelayTracking.get(delayKey)!;
+          const daysSinceTriggered = (now.getTime() - triggerTime.getTime()) / (1000 * 60 * 60 * 24);
+          
+          if (daysSinceTriggered >= condition.delay_days) {
+            logger.info(`Delay period of ${condition.delay_days} days has passed for ${condition.target_asset}`);
+            // Remove from tracking since condition is now met
+            this.triggerDelayTracking.delete(delayKey);
+            return true;
+          } else {
+            logger.info(`Waiting for delay: ${daysSinceTriggered.toFixed(1)}/${condition.delay_days} days for ${condition.target_asset}`);
+            return false;
+          }
+        } else {
+          // First time triggers are met, start delay tracking
+          this.triggerDelayTracking.set(delayKey, now);
+          logger.info(`Multi-asset triggers met for ${condition.target_asset}, starting ${condition.delay_days} day delay`);
+          return false;
+        }
+      }
+
+      // No delay specified, execute immediately
+      if (allTriggersActive) {
+        logger.info(`All multi-asset triggers met for target: ${condition.target_asset}`);
+      }
+
+      return allTriggersActive;
+    } catch (error) {
+      logger.error('Error checking multi asset correlation:', error);
       return false;
     }
   }

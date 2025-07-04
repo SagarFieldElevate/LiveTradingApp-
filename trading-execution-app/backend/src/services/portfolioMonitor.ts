@@ -83,7 +83,8 @@ export class PortfolioMonitor {
         const newStopPrice = await this.calculateTrailingStop(
           currentPrice,
           position.entry_price,
-          strategy.exit_conditions.stop_loss
+          strategy.exit_conditions.stop_loss,
+          position.asset
         );
 
         if (newStopPrice > position.trailing_stop_price) {
@@ -113,12 +114,19 @@ export class PortfolioMonitor {
 
     // Check max hold period
     const strategy = strategyManager.getStrategy(position.strategy_id);
-    if (strategy?.exit_conditions.max_hold_period) {
+    if (strategy?.exit_conditions) {
       const holdTime = Date.now() - position.entry_time.getTime();
-      const maxHoldMs = strategy.exit_conditions.max_hold_period.value * 
-        (strategy.exit_conditions.max_hold_period.unit === 'days' ? 86400000 : 3600000);
+      let maxHoldMs: number | null = null;
+
+      // Handle both max_hold_days (direct number) and max_hold_period (object) formats
+      if (strategy.exit_conditions.max_hold_days) {
+        maxHoldMs = strategy.exit_conditions.max_hold_days * 86400000; // Convert days to ms
+      } else if (strategy.exit_conditions.max_hold_period) {
+        maxHoldMs = strategy.exit_conditions.max_hold_period.value * 
+          (strategy.exit_conditions.max_hold_period.unit === 'days' ? 86400000 : 3600000);
+      }
       
-      if (holdTime > maxHoldMs) {
+      if (maxHoldMs && holdTime > maxHoldMs) {
         shouldExit = true;
         exitReason = 'Max hold period exceeded';
       }
@@ -141,7 +149,8 @@ export class PortfolioMonitor {
   private async calculateTrailingStop(
     currentPrice: number,
     entryPrice: number,
-    stopLossConfig: any
+    stopLossConfig: any,
+    asset: string = this.currentAsset
   ): Promise<number> {
     let stopDistance: number;
 
@@ -152,11 +161,11 @@ export class PortfolioMonitor {
         
       case 'atr':
         try {
-          const atr = await technicalIndicators.calculateATR(this.currentAsset, 14);
+          const atr = await technicalIndicators.calculateATR(asset, 14);
           stopDistance = atr * stopLossConfig.value;
         } catch (error) {
           // Fallback to percentage-based stop
-          logger.warn('ATR calculation failed for trailing stop, using 2%');
+          logger.warn(`ATR calculation failed for ${asset} trailing stop, using 2%`);
           stopDistance = currentPrice * 0.02;
         }
         break;

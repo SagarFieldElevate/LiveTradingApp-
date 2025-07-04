@@ -82,16 +82,18 @@ export class TradeExecutor {
       const quantity = (positionSize / currentPrice).toFixed(8);
 
       // Calculate stop loss and take profit prices
-      const stopLossPrice = this.calculateStopLoss(
+      const stopLossPrice = await this.calculateStopLoss(
         currentPrice,
         strategy.exit_conditions.stop_loss,
-        'buy' // Assuming long only for now
+        'buy',
+        asset
       );
 
-      const takeProfitPrice = this.calculateTakeProfit(
+      const takeProfitPrice = await this.calculateTakeProfit(
         currentPrice,
         strategy.exit_conditions.take_profit,
-        'buy'
+        'buy',
+        asset
       );
 
       // Create order
@@ -212,11 +214,12 @@ export class TradeExecutor {
     }
   }
 
-  private calculateStopLoss(
+  private async calculateStopLoss(
     entryPrice: number,
     stopLossConfig: any,
-    side: 'buy' | 'sell'
-  ): number {
+    side: 'buy' | 'sell',
+    asset: string
+  ): Promise<number> {
     let stopPrice: number;
 
     switch (stopLossConfig.type) {
@@ -228,19 +231,17 @@ export class TradeExecutor {
         break;
         
       case 'atr':
-        // For ATR-based stops, we'll use a default ATR value if not available
         try {
-          const atr = technicalIndicators.calculateATR(
-            portfolioMonitor.getCurrentAsset() || 'BTC-USD', 
-            14
-          ).then(atrValue => atrValue).catch(() => entryPrice * 0.02);
+          // Properly await ATR calculation
+          const atr = await technicalIndicators.calculateATR(asset, 14);
+          const atrMultiplier = stopLossConfig.value || 2.0;
           
           stopPrice = side === 'buy'
-            ? entryPrice - (entryPrice * 0.02 * stopLossConfig.value) // Use 2% as proxy for ATR
-            : entryPrice + (entryPrice * 0.02 * stopLossConfig.value);
+            ? entryPrice - (atr * atrMultiplier)
+            : entryPrice + (atr * atrMultiplier);
         } catch (error) {
           // Fallback to percentage-based stop
-          logger.warn('ATR calculation failed, using 2% stop loss');
+          logger.warn(`ATR calculation failed for ${asset}, using 2% stop loss`);
           stopPrice = side === 'buy'
             ? entryPrice * 0.98
             : entryPrice * 1.02;
@@ -257,11 +258,12 @@ export class TradeExecutor {
     return parseFloat(stopPrice.toFixed(2));
   }
 
-  private calculateTakeProfit(
+  private async calculateTakeProfit(
     entryPrice: number,
     takeProfitConfig: any,
-    side: 'buy' | 'sell'
-  ): number {
+    side: 'buy' | 'sell',
+    asset: string
+  ): Promise<number> {
     let targetPrice: number;
 
     switch (takeProfitConfig.type) {
@@ -274,14 +276,16 @@ export class TradeExecutor {
         
       case 'atr':
         try {
-          // Use 2% as proxy for ATR
-          const atrProxy = entryPrice * 0.02;
+          // Properly await ATR calculation
+          const atr = await technicalIndicators.calculateATR(asset, 14);
+          const atrMultiplier = takeProfitConfig.value || 3.0;
+          
           targetPrice = side === 'buy'
-            ? entryPrice + (atrProxy * takeProfitConfig.value)
-            : entryPrice - (atrProxy * takeProfitConfig.value);
+            ? entryPrice + (atr * atrMultiplier)
+            : entryPrice - (atr * atrMultiplier);
         } catch (error) {
           // Fallback to percentage-based target
-          logger.warn('ATR calculation failed, using 5% take profit');
+          logger.warn(`ATR calculation failed for ${asset}, using 5% take profit`);
           targetPrice = side === 'buy'
             ? entryPrice * 1.05
             : entryPrice * 0.95;

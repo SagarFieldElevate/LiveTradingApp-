@@ -1,247 +1,298 @@
-import { createHash } from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import { logger } from '../utils/logger';
-import { pineconeService } from './pineconeService';
-import { aiParser } from './aiParser';
-import { strategyManager } from './strategyManager';
-import { portfolioMonitor } from './portfolioMonitor';
-import { marketDataStream } from './marketDataStream';
-import { circuitBreaker } from './circuitBreaker';
+import { databaseService } from '../config/database';
+import { TradeSignal } from '../types';
 
-interface ComplianceRecord {
-  id: string;
-  timestamp: string;
-  action_type: 'TRADE' | 'MODIFY' | 'CANCEL' | 'SYSTEM' | 'ERROR' | 'CIRCUIT_BREAKER';
-  initiator: string;
-  authorization: string;
-  market_data_snapshot: any;
-  system_state: any;
-  decision_factors: any;
-  regulatory_flags: string[];
-  hash: string;
-  previous_hash: string;
+export interface ComplianceEvent {
+  id?: number;
+  event_type: string;
+  strategy_id?: string;
+  symbol?: string;
+  action?: string;
+  details: any;
+  risk_assessment?: any;
+  approval_status?: 'pending' | 'approved' | 'rejected';
+  timestamp?: Date;
+  session_id?: string;
+  user_id?: string;
 }
 
 export class ComplianceLogger {
-  private lastHash: string = '0';
-  private recordChain: ComplianceRecord[] = [];
-  private isDemoMode: boolean = false;
+  private logDir: string;
+  private currentSession: string;
+
+  constructor() {
+    this.logDir = path.join(process.cwd(), 'logs', 'compliance');
+    this.currentSession = new Date().toISOString().slice(0, 19).replace(/:/g, '-');
+    
+    // Ensure log directory exists
+    if (!fs.existsSync(this.logDir)) {
+      fs.mkdirSync(this.logDir, { recursive: true });
+    }
+  }
+
+  private async logToFile(event: ComplianceEvent): Promise<void> {
+    try {
+      const logFile = path.join(this.logDir, `compliance-${new Date().toISOString().slice(0, 10)}.jsonl`);
+      const logEntry = JSON.stringify({
+        ...event,
+        timestamp: event.timestamp || new Date(),
+        session_id: event.session_id || this.currentSession
+      }) + '\n';
+      
+      fs.appendFileSync(logFile, logEntry);
+    } catch (error) {
+      console.error('Failed to write compliance log to file:', error);
+    }
+  }
+
+  private async logToDatabase(event: ComplianceEvent): Promise<number | null> {
+    try {
+      const sql = `
+        INSERT INTO compliance_logs (
+          event_type, strategy_id, symbol, action, details, 
+          risk_assessment, approval_status, session_id, user_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `;
+      
+      const params = [
+        event.event_type,
+        event.strategy_id || null,
+        event.symbol || null,
+        event.action || null,
+        JSON.stringify(event.details),
+        event.risk_assessment ? JSON.stringify(event.risk_assessment) : null,
+        event.approval_status || null,
+        event.session_id || this.currentSession,
+        event.user_id || 'system'
+      ];
+
+      return await databaseService.insert(sql, params);
+    } catch (error) {
+      console.error('Failed to write compliance log to database:', error);
+      return null;
+    }
+  }
+
+  async logEvent(event: ComplianceEvent): Promise<void> {
+    // Log to both file and database for redundancy
+    await Promise.allSettled([
+      this.logToFile(event),
+      this.logToDatabase(event)
+    ]);
+    
+    logger.info(`📋 Compliance event logged: ${event.event_type}`);
+  }
 
   async logTradeDecision(
-    decision: any,
+    signal: TradeSignal,
     marketData: any,
     systemState: any
   ): Promise<void> {
-    const record: ComplianceRecord = {
-      id: `trade_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      timestamp: new Date().toISOString(),
-      action_type: 'TRADE',
-      initiator: decision.strategy_id || 'SYSTEM',
-      authorization: 'AUTOMATED',
-      market_data_snapshot: {
-        prices: marketData,
-        timestamp: new Date().toISOString(),
-        spreads: {},
-        volumes: {}
+    const riskAssessment = {
+      volatility: this.calculateVolatility(marketData),
+      liquidity_check: this.checkLiquidity(signal.asset),
+      position_sizing: this.validatePositionSize(signal, systemState),
+      market_conditions: this.assessMarketConditions(marketData),
+      strategy_health: this.checkStrategyHealth(signal.strategy_id, systemState)
+    };
+
+    await this.logEvent({
+      event_type: 'trade_decision',
+      strategy_id: signal.strategy_id,
+      symbol: signal.asset,
+      action: `${signal.action}_${signal.side}`,
+      details: {
+        signal: signal,
+        market_data: marketData,
+        system_state: systemState,
+        timestamp: new Date()
       },
-      system_state: {
-        active_strategies: systemState.activeStrategies,
-        open_positions: systemState.openPositions,
-        daily_pnl: systemState.dailyPnl,
-        circuit_breaker_status: systemState.circuitBreakerStatus
-      },
-      decision_factors: decision,
-      regulatory_flags: this.checkRegulatoryFlags(decision),
-      hash: '',
-      previous_hash: this.lastHash
-    };
-
-    // Generate hash for immutability
-    record.hash = this.generateHash(record);
-    this.lastHash = record.hash;
-
-    // Store in multiple locations
-    await this.storeRecord(record);
-    
-    logger.info(`Compliance record logged: ${record.id}`);
+      risk_assessment: riskAssessment,
+      approval_status: 'approved' // Auto-approved for now
+    });
   }
 
-  async logCircuitBreaker(reason: string, details: any): Promise<void> {
-    const record: ComplianceRecord = {
-      id: `cb_${Date.now()}`,
-      timestamp: new Date().toISOString(),
-      action_type: 'CIRCUIT_BREAKER',
-      initiator: 'SYSTEM',
-      authorization: 'AUTOMATIC',
-      market_data_snapshot: {},
-      system_state: await this.captureSystemState(),
-      decision_factors: { reason, details },
-      regulatory_flags: ['TRADING_HALT', 'RISK_LIMIT'],
-      hash: '',
-      previous_hash: this.lastHash
-    };
-
-    record.hash = this.generateHash(record);
-    this.lastHash = record.hash;
-
-    await this.storeRecord(record);
-  }
-
-  async logCircuitBreakerReset(authority: string): Promise<void> {
-    const record: ComplianceRecord = {
-      id: `cb_reset_${Date.now()}`,
-      timestamp: new Date().toISOString(),
-      action_type: 'SYSTEM',
-      initiator: authority,
-      authorization: 'MANUAL_OVERRIDE',
-      market_data_snapshot: {},
-      system_state: await this.captureSystemState(),
-      decision_factors: { action: 'circuit_breaker_reset' },
-      regulatory_flags: ['MANUAL_INTERVENTION', 'TRADING_RESUMED'],
-      hash: '',
-      previous_hash: this.lastHash
-    };
-
-    record.hash = this.generateHash(record);
-    this.lastHash = record.hash;
-
-    await this.storeRecord(record);
-  }
-
-  async logError(error: Error, context: any): Promise<void> {
-    const record: ComplianceRecord = {
-      id: `error_${Date.now()}`,
-      timestamp: new Date().toISOString(),
-      action_type: 'ERROR',
-      initiator: 'SYSTEM',
-      authorization: 'N/A',
-      market_data_snapshot: {},
-      system_state: await this.captureSystemState(),
-      decision_factors: {
+  async logError(error: Error, context: any = {}): Promise<void> {
+    await this.logEvent({
+      event_type: 'system_error',
+      details: {
         error_message: error.message,
         error_stack: error.stack,
-        context
-      },
-      regulatory_flags: ['SYSTEM_ERROR'],
-      hash: '',
-      previous_hash: this.lastHash
-    };
-
-    record.hash = this.generateHash(record);
-    this.lastHash = record.hash;
-
-    await this.storeRecord(record);
-  }
-
-  private generateHash(record: ComplianceRecord): string {
-    const content = JSON.stringify({
-      ...record,
-      hash: undefined
+        context: context,
+        timestamp: new Date()
+      }
     });
-    
-    return createHash('sha256').update(content).digest('hex');
-  }
 
-  async storeRecord(record: ComplianceRecord): Promise<void> {
-    if (this.isDemoMode) {
-      logger.info('Demo mode: Would store compliance record');
-      return;
-    }
-
+    // Also log to system events table
     try {
-      // Check if Pinecone is actually ready before trying to use it
-      if (!pineconeService) {
-        console.log('Pinecone service not available - skipping compliance record storage');
-        return;
-      }
-
-      let executionIndex;
-      try {
-        executionIndex = pineconeService.getExecutionIndex();
-      } catch (error) {
-        console.log('Pinecone not initialized yet - skipping compliance record storage');
-        return;
-      }
-
-      if (!executionIndex) {
-        console.log('Pinecone execution index not available - skipping compliance record storage');
-        return;
-      }
-
-      const embedding = await aiParser.generateEmbedding(
-        JSON.stringify(record.decision_factors)
-      );
+      const sql = `
+        INSERT INTO system_events (event_type, severity, message, details, source)
+        VALUES (?, ?, ?, ?, ?)
+      `;
       
-      await executionIndex.upsert([{
-        id: `compliance_${record.id}`,
-        values: embedding,
-        metadata: {
-          ...record,
-          type: 'compliance',
-          stored_at: new Date().toISOString()
-        }
-      }]);
+      await databaseService.insert(sql, [
+        'error',
+        'error',
+        error.message,
+        JSON.stringify({ stack: error.stack, context }),
+        'compliance_logger'
+      ]);
+    } catch (dbError) {
+      console.error('Failed to log error to system events:', dbError);
+    }
+  }
 
-      // Keep recent records in memory
-      this.recordChain.push(record);
-      if (this.recordChain.length > 1000) {
-        this.recordChain.shift();
+  async logStrategyApproval(strategyId: string, userId: string, approved: boolean, reason?: string): Promise<void> {
+    await this.logEvent({
+      event_type: 'strategy_approval',
+      strategy_id: strategyId,
+      action: approved ? 'approve' : 'reject',
+      details: {
+        approved: approved,
+        reason: reason || '',
+        timestamp: new Date()
+      },
+      approval_status: approved ? 'approved' : 'rejected',
+      user_id: userId
+    });
+  }
+
+  async logCircuitBreakerEvent(reason: string, systemState: any): Promise<void> {
+    await this.logEvent({
+      event_type: 'circuit_breaker_triggered',
+      details: {
+        reason: reason,
+        system_state: systemState,
+        timestamp: new Date()
+      }
+    });
+
+    // Log as critical system event
+    try {
+      const sql = `
+        INSERT INTO system_events (event_type, severity, message, details, source)
+        VALUES (?, ?, ?, ?, ?)
+      `;
+      
+      await databaseService.insert(sql, [
+        'circuit_breaker',
+        'critical',
+        `Circuit breaker triggered: ${reason}`,
+        JSON.stringify(systemState),
+        'compliance_logger'
+      ]);
+    } catch (error) {
+      console.error('Failed to log circuit breaker event:', error);
+    }
+  }
+
+  async getComplianceLogs(filter: {
+    event_type?: string;
+    strategy_id?: string;
+    from_date?: Date;
+    to_date?: Date;
+    limit?: number;
+  } = {}): Promise<ComplianceEvent[]> {
+    try {
+      let sql = 'SELECT * FROM compliance_logs WHERE 1=1';
+      const params: any[] = [];
+
+      if (filter.event_type) {
+        sql += ' AND event_type = ?';
+        params.push(filter.event_type);
       }
 
-      // Also write to file for backup
-      // This would write to a compliance log file
+      if (filter.strategy_id) {
+        sql += ' AND strategy_id = ?';
+        params.push(filter.strategy_id);
+      }
+
+      if (filter.from_date) {
+        sql += ' AND timestamp >= ?';
+        params.push(filter.from_date.toISOString());
+      }
+
+      if (filter.to_date) {
+        sql += ' AND timestamp <= ?';
+        params.push(filter.to_date.toISOString());
+      }
+
+      sql += ' ORDER BY timestamp DESC';
+
+      if (filter.limit) {
+        sql += ' LIMIT ?';
+        params.push(filter.limit);
+      }
+
+      const rows = await databaseService.all(sql, params);
+      
+      return rows.map(row => ({
+        ...row,
+        details: JSON.parse(row.details),
+        risk_assessment: row.risk_assessment ? JSON.parse(row.risk_assessment) : undefined,
+        timestamp: new Date(row.timestamp)
+      }));
     } catch (error) {
-      // Don't create recursive errors - just log to console
-      console.error('Failed to store compliance record:', error);
+      logger.error('❌ Failed to get compliance logs:', error);
+      return [];
     }
   }
 
-  private checkRegulatoryFlags(decision: any): string[] {
-    const flags: string[] = [];
-    
-    if (decision.position_size > 10000) {
-      flags.push('LARGE_POSITION');
-    }
-    
-    if (decision.leverage > 1) {
-      flags.push('LEVERAGED_TRADE');
-    }
-    
-    if (decision.asset?.includes('CRYPTO')) {
-      flags.push('CRYPTOCURRENCY');
-    }
-    
-    return flags;
+  async getAuditTrail(strategyId: string): Promise<ComplianceEvent[]> {
+    return this.getComplianceLogs({
+      strategy_id: strategyId,
+      limit: 1000
+    });
   }
 
-  private async captureSystemState(): Promise<any> {
-    try {
-      // Dynamic imports to avoid circular dependency
-      const { strategyManager } = await import('./strategyManager');
-      const { portfolioMonitor } = await import('./portfolioMonitor');
-      const { circuitBreaker } = await import('./circuitBreaker');
-      const { marketDataStream } = await import('./marketDataStream');
+  private calculateVolatility(marketData: any): number {
+    // Simple volatility calculation based on bid-ask spread
+    if (!marketData || typeof marketData !== 'object') return 0;
+    
+    const symbols = Object.keys(marketData);
+    let totalVolatility = 0;
+    let count = 0;
 
-      return {
-        timestamp: new Date().toISOString(),
-        active_strategies: strategyManager.getActiveStrategies().length,
-        open_positions: portfolioMonitor.getOpenPositions().length,
-        circuit_breaker_active: circuitBreaker.isActive(),
-        market_data_connected: marketDataStream.getConnectionStatus()
-      };
-    } catch (error) {
-      logger.error('Error capturing system state:', error);
-      return {
-        timestamp: new Date().toISOString(),
-        error: 'Failed to capture system state'
-      };
+    for (const symbol of symbols) {
+      const data = marketData[symbol];
+      if (data && data.bid && data.ask && data.price) {
+        const spread = (data.ask - data.bid) / data.price;
+        totalVolatility += spread;
+        count++;
+      }
     }
+
+    return count > 0 ? totalVolatility / count : 0;
   }
 
-  async generateComplianceReport(startDate: Date, endDate: Date): Promise<any> {
-    // Query records from Pinecone
-    // Generate formatted report
-    // Include all trades, errors, circuit breaker events
-    logger.info(`Generating compliance report from ${startDate} to ${endDate}`);
+  private checkLiquidity(asset: string): boolean {
+    // Major crypto assets are considered liquid
+    const liquidAssets = ['BTC', 'ETH', 'BTC-USD', 'ETH-USD'];
+    return liquidAssets.includes(asset);
+  }
+
+  private validatePositionSize(signal: TradeSignal, systemState: any): boolean {
+    // Basic position sizing validation
+    if (!systemState.activeStrategies) return true;
+    
+    return systemState.activeStrategies < 10; // Max 10 active strategies
+  }
+
+  private assessMarketConditions(marketData: any): string {
+    const volatility = this.calculateVolatility(marketData);
+    
+    if (volatility > 0.05) return 'high_volatility';
+    if (volatility > 0.02) return 'moderate_volatility';
+    return 'normal';
+  }
+
+  private checkStrategyHealth(strategyId: string, systemState: any): boolean {
+    // Check if strategy has been performing well
+    if (!systemState.dailyPnl) return true;
+    
+    return systemState.dailyPnl > -1000; // Not losing more than $1000/day
   }
 }
 
